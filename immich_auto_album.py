@@ -9,7 +9,9 @@ import fnmatch
 import os
 import datetime
 from collections import defaultdict, OrderedDict
+import json
 import random
+import sqlite3
 from urllib.error import HTTPError
 
 import regex
@@ -39,9 +41,8 @@ REQUEST_TIMEOUT_DEFAULT = 20
 
 # Constants for album thumbnail setting
 ALBUM_THUMBNAIL_RANDOM_ALL = "random-all"
-ALBUM_THUMBNAIL_RANDOM_FILTERED = "random-filtered"
 ALBUM_THUMBNAIL_SETTINGS = ["first", "last", "random"]
-ALBUM_THUMBNAIL_SETTINGS_GLOBAL = ALBUM_THUMBNAIL_SETTINGS + [ALBUM_THUMBNAIL_RANDOM_ALL, ALBUM_THUMBNAIL_RANDOM_FILTERED]
+ALBUM_THUMBNAIL_SETTINGS_GLOBAL = ALBUM_THUMBNAIL_SETTINGS + [ALBUM_THUMBNAIL_RANDOM_ALL]
 ALBUM_THUMBNAIL_STATIC_INDICES = {
     "first": 0,
     "last": -1,
@@ -126,77 +127,6 @@ class AlbumModel:
         """
         return [asset_to_add['id'] for asset_to_add in self.assets]
 
-    def find_incompatible_properties(self, other) -> list[str]:
-        """ 
-        Checks whether this Album Model and the other album model are compatible in terms of 
-        describing the same album for creation in a way that no album properties are in conflict
-        with each other.
-        All properties must either bei the same or not present in both objects, except for
-          - id
-          - name
-          - assets
-        
-        Parameters
-        ----------
-        other : AlbumModel
-            The other album model to check against
-        
-        Returns
-        ---------
-            A list of string representations for incompatible properties. The list is empty
-            if there are no incompatible properties
-        """
-        if not isinstance(other, AlbumModel):
-            return False
-        incompatible_props = []
-        props = self.get_album_properties_dict()
-        other_props = other.get_album_properties_dict()
-        for prop in props:
-            if props[prop] != other_props[prop]:
-                incompatible_props.append(f'{prop}: {props[prop]} vs {other_props[prop]}')
-
-        return incompatible_props
-
-    def merge_from(self, other, merge_mode: int):
-        """ 
-        Merges properties of other in self. The only properties not
-        considered for merging are
-          - id
-          - name
-          - assets
-
-        Parameters
-        ----------
-        other : AlbumModel
-            The other album model to merge properties from
-        merge_mode: int
-            Defines how the merge should be performed:
-            - AlbumModel.ALBUM_MERGE_MODE_EXCLUSIVE: Only merge properties that are not already set in the merge target
-            - AlbumModel.ALBUM_MERGE_MODE_EXCLUSIVE_EX: Same as above, but also raises an exception if attempting to merge an existing property
-            - AlbumModel.ALBUM_MERGE_MODE_OVERRIDE: Overrides any existing property in merge target
-        """
-        # Do not try to merge unrelated types
-        if not isinstance(other, AlbumModel):
-            logging.warning("Trying to merge AlbumModel with incompatible type!")
-            return
-        own_attribs = vars(self)
-        other_attribs = vars(other)
-
-        # Override merge mode
-        if merge_mode == AlbumModel.ALBUM_MERGE_MODE_OVERRIDE:
-            for prop_name in AlbumModel.ALBUM_PROPERTIES_VARIABLES:
-                if other_attribs[prop_name]:
-                    own_attribs[prop_name] = other_attribs[prop_name]
-
-        # Exclusive merge modes
-        elif merge_mode in [AlbumModel.ALBUM_MERGE_MODE_EXCLUSIVE, AlbumModel.ALBUM_MERGE_MODE_EXCLUSIVE_EX]:
-            for prop_name in AlbumModel.ALBUM_PROPERTIES_VARIABLES:
-                if other_attribs[prop_name]:
-                    if own_attribs[prop_name] and merge_mode == AlbumModel.ALBUM_MERGE_MODE_EXCLUSIVE_EX:
-                        raise AlbumMergeException(f"Attempting to override {prop_name} in {self.name} with {other_attribs[prop_name]}")
-                    own_attribs[prop_name] = other_attribs[prop_name]
-
-
     def get_final_name(self) -> str:
         """ 
         Gets the album model's name to use when talking to Immich, i.e.
@@ -210,273 +140,6 @@ class AlbumModel:
             return self.override_name
         return self.name
 
-    @staticmethod
-    def parse_album_properties_file(album_properties_file_path: str):
-        """ 
-        Parses the provided album properties file into an AlbumModel
-
-        Parameters
-        ----------
-            album_properties_file_path : str
-                The fully qualified path to a valid album properties file
-        
-        Returns
-        ---------
-            An AlbumModel that represents the album properties
-
-        Raises
-        ---------
-            YAMLError
-                If the provided album properties file could not be found or parsed
-        """
-        with open(album_properties_file_path, 'r', encoding="utf-8") as stream:
-            album_properties = yaml.safe_load(stream)
-            if album_properties:
-                album_props_template = AlbumModel(None)
-                album_props_template_vars = vars(album_props_template)
-                for album_prop_name in AlbumModel.ALBUM_PROPERTIES_VARIABLES:
-                    if album_prop_name in album_properties:
-                        album_props_template_vars[album_prop_name] = album_properties[album_prop_name]
-
-                return album_props_template
-
-        return None
-
-def find_albumprops_files(paths: list[str]) -> list[str]:
-    """ 
-    Recursively finds all album properties files in all passed paths.
-
-    Parameters
-    ----------
-        paths : list[str]
-            A list of paths to search for album properties files
-    
-    Returns
-    ---------
-        A list of paths with all album properties files
-    """
-    albumprops_files = []
-    for path in paths:
-        if not os.path.isdir(path):
-            logging.warning("Album Properties Discovery: Path %s does not exist!", path)
-            continue
-        for path_tuple in os.walk(path):
-            root = path_tuple[0]
-            filenames = path_tuple[2]
-            for filename in fnmatch.filter(filenames, ALBUMPROPS_FILE_NAME):
-                albumprops_files.append(os.path.join(root, filename))
-    return albumprops_files
-
-def identify_root_path(path: str, root_path_list: list[str]) -> str:
-    """
-    Identifies which root path is the parent of the provided path.
-    
-    :param path: The path to find the root path for
-    :type path: str
-    :param root_path_list: The list of root paths to get the one path is a child of from
-    :type root_path_list: list[str]
-    :return: The root path from root_path_list that is the parent of path
-    :rtype: str
-    """
-    for root_path in root_path_list:
-        if root_path in path:
-            return root_path
-    return None
-
-def build_album_properties_templates() -> dict:
-    """ 
-    Searches all root paths for album properties files,
-    applies ignore/filtering mechanisms, parses the files,
-    creates AlbumModel objects from them, performs validations and returns
-    a dictionary mapping mapping the album name (generated from the path the album properties file was found in)
-    to the album model file.
-    If a fatal error occurs during processing of album properties files (i.e. two files encountered targeting the same album with incompatible properties), the
-    program exits.
-    
-    Returns
-    ---------
-        A dictionary mapping mapping the album name (generated from the path the album properties file was found in)
-        to the album model files
-    """
-    fatal_error_occurred = False
-    album_properties_file_paths = find_albumprops_files(root_paths)
-    # Dictionary mapping album name generated from album properties' path to the AlbumModel representing the
-    # album properties
-    album_props_templates = {}
-    album_name_to_album_properties_file_path = {}
-    for album_properties_file_path in album_properties_file_paths:
-        # First check global path_filter and ignore options
-        if is_path_ignored(album_properties_file_path):
-            continue
-
-        # Identify the root path
-        album_props_root_path = identify_root_path(album_properties_file_path, root_paths)
-        if not album_props_root_path:
-            continue
-
-        # Chunks of the asset's path below root_path
-        path_chunks = album_properties_file_path.replace(album_props_root_path, '').split('/')
-        # A single chunk means it's just the image file in no sub folder, ignore
-        if len(path_chunks) == 1:
-            continue
-
-        # remove last item from path chunks, which is the file name
-        del path_chunks[-1]
-        album_name = create_album_name(path_chunks, album_level_separator, album_name_post_regex)
-
-        try:
-            # Parse the album properties into an album model
-            album_props_template = AlbumModel.parse_album_properties_file(album_properties_file_path)
-            if not album_props_template:
-                logging.warning("Unable to parse album properties file %s", album_properties_file_path)
-                continue
-
-            album_props_template.name = album_name
-            if not album_name in album_props_templates:
-                album_props_templates[album_name] = album_props_template
-                album_name_to_album_properties_file_path[album_name] = album_properties_file_path
-            # There is already an album properties template with the same album name (maybe from a different root_path)
-            else:
-                incompatible_props = album_props_template.find_incompatible_properties(album_props_templates[album_name])
-                if len(incompatible_props) > 0:
-                    logging.fatal("Album Properties files %s and %s create an album with identical name but have conflicting properties:",
-                                album_name_to_album_properties_file_path[album_name], album_properties_file_path)
-                    for incompatible_prop in incompatible_props:
-                        logging.fatal(incompatible_prop)
-                    fatal_error_occurred = True
-
-        except yaml.YAMLError as ex:
-            logging.error("Could not parse album properties file %s: %s", album_properties_file_path, ex)
-
-    if fatal_error_occurred:
-        logging.fatal("Encountered at least one fatal error during parsing or validating of album properties files, exiting!")
-        sys.exit(1)
-
-    # Now validate that all album properties templates with the same override_name are compatible with each other
-    validate_album_props_templates(album_props_templates.values(), album_name_to_album_properties_file_path)
-
-    return album_props_templates
-
-def validate_album_props_templates(album_props_templates: list[AlbumModel], album_name_to_album_properties_file_path: dict):
-    """ 
-    Validates the provided list of album properties.
-    Specifically, checks that if multiple album properties files specify the same override_name, all other specified properties
-    are the same as well.
-
-    If a validation error occurs, the program exits.
-
-    Parameters
-    ----------
-        album_props_templates : list[AlbumModel]
-            The list AlbumModel objects to validate
-        album_name_to_album_properties_file_path : dict
-            A dictionary where the key is an album name and the value is the path to the album properties file the
-            album was generated from.
-            This method expects one entry in this dictionary for every AlbumModel in album_props_templates
-    """
-    fatal_error_occurred = False
-    # This is a cache to remember checked names - keep time complexity down
-    checked_override_names = []
-    # Loop over all album properties templates
-    for album_props_template in album_props_templates:
-        # Check if override_name is set and not already checked
-        if album_props_template.override_name and album_props_template.override_name not in checked_override_names:
-            # Inner loop through album properties template
-            for album_props_template_to_check in album_props_templates:
-                # Do not check against ourselves and only check if the other template has the same override name (we already checked above that override_name is not None)
-                if (album_props_template is not album_props_template_to_check
-                    and album_props_template.override_name == album_props_template_to_check.override_name):
-                    if check_for_and_log_incompatible_properties(album_props_template, album_props_template_to_check, album_name_to_album_properties_file_path):
-                        fatal_error_occurred = True
-            checked_override_names.append(album_props_template.override_name)
-
-    if fatal_error_occurred:
-        logging.fatal("Encountered at least one fatal error while validating album properties files, exiting!")
-        sys.exit(1)
-
-def check_for_and_log_incompatible_properties(model1: AlbumModel, model2: AlbumModel, album_name_to_album_properties_file_path: dict) -> bool:
-    """
-    Checks if model1 and model2 have incompatible properties (same properties set to different values). If so,
-    logs the the incompatible properties and returns True.
-
-    Parameters
-    ----------
-      - model1 : AlbumModel
-            The first album model to check for incompatibility with the second model
-      - model2 : AlbumModel
-            The second album model to check for incompatibility with the first model
-      - album_name_to_album_properties_file_path : dict
-            A dictionary where the key is an album name and the value is the path to the album properties file the
-            album was generated from.
-            This method expects one entry in this dictionary for every AlbumModel in album_props_templates
-    Returns
-    ---------
-        False if model1 and model2 are compatible, otherwise True
-    """
-    incompatible_props = model1.find_incompatible_properties(model2)
-    if len(incompatible_props) > 0:
-        logging.fatal("Album properties files %s and %s define the same override_name but have incompatible properties:",
-                        album_name_to_album_properties_file_path[model1.name],
-                        album_name_to_album_properties_file_path[model2.name])
-        for incompatible_prop in incompatible_props:
-            logging.fatal(incompatible_prop)
-        return True
-    return False
-
-def is_integer(string_to_test: str) -> bool:
-    """ 
-    Trying to deal with python's isnumeric() function
-    not recognizing negative numbers, tests whether the provided 
-    string is an integer or not.
-
-    Parameters
-    ----------
-        string_to_test : str
-            The string to test for integer
-    Returns
-    ---------
-        True if string_to_test is an integer, otherwise False
-    """
-    try:
-        int(string_to_test)
-        return True
-    except ValueError:
-        return False
-
-# Translation of GLOB-style patterns to Regex
-# Source: https://stackoverflow.com/a/63212852
-# FIXME_EVENTUALLY: Replace with glob.translate() introduced with Python 3.13
-escaped_glob_tokens_to_re = OrderedDict((
-    # Order of ``**/`` and ``/**`` in RE tokenization pattern doesn't matter because ``**/`` will be caught first no matter what, making ``/**`` the only option later on.
-    # W/o leading or trailing ``/`` two consecutive asterisks will be treated as literals.
-    ('/\\*\\*', '(?:/.+?)*'), # Edge-case #1. Catches recursive globs in the middle of path. Requires edge case #2 handled after this case.
-    ('\\*\\*/', '(?:^.+?/)*'), # Edge-case #2. Catches recursive globs at the start of path. Requires edge case #1 handled before this case. ``^`` is used to ensure proper location for ``**/``.
-    ('\\*', '[^/]*'), # ``[^/]*`` is used to ensure that ``*`` won't match subdirs, as with naive ``.*?`` solution.
-    ('\\?', '.'),
-    ('\\[\\*\\]', '\\*'), # Escaped special glob character.
-    ('\\[\\?\\]', '\\?'), # Escaped special glob character.
-    ('\\[!', '[^'), # Requires ordered dict, so that ``\\[!`` preceded ``\\[`` in RE pattern.
-                    # Needed mostly to differentiate between ``!`` used within character class ``[]`` and outside of it, to avoid faulty conversion.
-    ('\\[', '['),
-    ('\\]', ']'),
-))
-
-escaped_glob_replacement = regex.compile('(%s)' % '|'.join(escaped_glob_tokens_to_re).replace('\\', '\\\\\\'))
-
-def glob_to_re(pattern: str) -> str:
-    """ 
-    Converts the provided GLOB pattern to
-    a regular expression.
-
-    Parameters
-    ----------
-        pattern : str
-            A GLOB-style pattern to convert to a regular expression
-    Returns
-    ---------
-        A regular expression matching the same strings as the provided GLOB pattern
-    """
-    return escaped_glob_replacement.sub(lambda match: escaped_glob_tokens_to_re[match.group(0)], regex.escape(pattern))
 
 def read_file(file_path: str) -> str:
     """ 
@@ -589,85 +252,6 @@ def parse_separated_string(separated_string: str, separator: str) -> Tuple[str, 
         value = separator.join(items[1:])
     return (key, value)
 
-
-def parse_separated_strings(items: list[str]) -> dict:
-    """
-    Parse a series of key-value pairs and return a dictionary
-    """
-    parsed_strings_dict = {}
-    if items:
-        for item in items:
-            key, value = parse_separated_string(item, '=')
-            parsed_strings_dict[key] = value
-    return parsed_strings_dict
-
-# pylint: disable=R0912
-def create_album_name(asset_path_chunks: list[str], album_separator: str, album_name_postprocess_regex: list) -> str:
-    """
-    Create album names from provided path_chunks string array.
-
-    The method uses global variables album_levels_range_arr or album_levels to
-    generate album names either by level range or absolute album levels. If multiple
-    album path chunks are used for album names they are separated by album_separator.
-
-    album_name_postprocess_regex is list of pairs of regex and replace, this is optional
-    """
-
-    album_name_chunks = ()
-    logging.debug("path chunks = %s", list(asset_path_chunks))
-    # Check which path to take: album_levels_range or album_levels
-    if len(album_levels_range_arr) == 2:
-        if album_levels_range_arr[0] < 0:
-            album_levels_start_level_capped = min(len(asset_path_chunks), abs(album_levels_range_arr[0]))
-            album_levels_end_level_capped =  album_levels_range_arr[1]+1
-            album_levels_start_level_capped *= -1
-        else:
-            album_levels_start_level_capped = min(len(asset_path_chunks)-1, album_levels_range_arr[0])
-            # Add 1 to album_levels_end_level_capped to include the end index, which is what the user intended to. It's not a problem
-            # if the end index is out of bounds.
-            album_levels_end_level_capped =  min(len(asset_path_chunks)-1, album_levels_range_arr[1]) + 1
-        logging.debug("album_levels_start_level_capped = %d", album_levels_start_level_capped)
-        logging.debug("album_levels_end_level_capped = %d", album_levels_end_level_capped)
-        # album start level is not equal to album end level, so we want a range of levels
-        if album_levels_start_level_capped is not album_levels_end_level_capped:
-
-            # if the end index is out of bounds.
-            if album_levels_end_level_capped < 0 and abs(album_levels_end_level_capped) >= len(asset_path_chunks):
-                album_name_chunks = asset_path_chunks[album_levels_start_level_capped:]
-            else:
-                album_name_chunks = asset_path_chunks[album_levels_start_level_capped:album_levels_end_level_capped]
-        # album start and end levels are equal, we want exactly that level
-        else:
-            # create on-the-fly array with a single element taken from
-            album_name_chunks = [asset_path_chunks[album_levels_start_level_capped]]
-    else:
-        album_levels_int = int(album_levels)
-        # either use as many path chunks as we have,
-        # or the specified album levels
-        album_name_chunk_size = min(len(asset_path_chunks), abs(album_levels_int))
-        if album_levels_int < 0:
-            album_name_chunk_size *= -1
-
-        # Copy album name chunks from the path to use as album name
-        album_name_chunks = asset_path_chunks[:album_name_chunk_size]
-        if album_name_chunk_size < 0:
-            album_name_chunks = asset_path_chunks[album_name_chunk_size:]
-    logging.debug("album_name_chunks = %s", album_name_chunks)
-
-    # final album name before regex
-    album_name = album_separator.join(album_name_chunks)
-    logging.debug("Album Name %s", album_name)
-
-    # apply regex if any
-    if album_name_postprocess_regex:
-        for pattern, *repl in album_name_postprocess_regex:
-            # If no replacement string provided, default to empty string
-            replace = repl[0] if repl else ''
-            album_name = regex.sub(pattern, replace, album_name)
-            logging.debug("Album Post Regex s/%s/%s/g --> %s", pattern, replace, album_name)
-
-    return album_name.strip()
-
 def fetch_server_version() -> dict:
     """
     Fetches the API version from the immich server.
@@ -698,6 +282,13 @@ def fetch_server_version() -> dict:
         logging.error("Communication with Immich API failed! Make sure the passed API URL is correct!")
         check_api_response(r)
     return server_version
+
+
+def sync_library(library_id: str):
+    now = datetime.datetime.now()
+    r = requests.post(root_url+'libraries/'+library_id+'/scan', **requests_kwargs, timeout=api_timeout)
+    r.raise_for_status()
+    pass
 
 
 def fetch_assets(is_not_in_album: bool, find_archived: bool) -> list:
@@ -848,47 +439,6 @@ def create_album(album_name_to_create: str) -> str:
     check_api_response(r)
 
     return r.json()['id']
-
-
-def is_path_ignored(path_to_check: str) -> bool:
-    """
-    Determines if the asset should be ignored for the purpose of this script
-    based in its originalPath and global ignore and path_filter options.
-
-    Parameters
-    ----------
-        asset_to_check : dict
-            The asset to check if it must be ignored or not. Must have the key 'originalPath'.
-    Returns 
-    ----------
-        True if the asset must be ignored, otherwise False
-    """
-    is_path_ignored_result = False
-    asset_root_path = None
-    for root_path_to_check in root_paths:
-        if root_path_to_check in path_to_check:
-            asset_root_path = root_path_to_check
-            break
-    logging.debug("Identified root_path for asset %s = %s", path_to_check, asset_root_path)
-    if asset_root_path:
-        # First apply filter, if any
-        if len(path_filter_regex) > 0:
-            any_match = False
-            for path_filter_regex_entry in path_filter_regex:
-                if regex.fullmatch(path_filter_regex_entry, path_to_check.replace(asset_root_path, '')):
-                    any_match = True
-            if not any_match:
-                logging.debug("Ignoring path %s due to path_filter setting!", path_to_check)
-                is_path_ignored_result = True
-        # If the asset "survived" the path filter, check if it is in the ignore_albums argument
-        if not is_path_ignored_result and len(ignore_albums_regex) > 0:
-            for ignore_albums_regex_entry in ignore_albums_regex:
-                if regex.fullmatch(ignore_albums_regex_entry, path_to_check.replace(asset_root_path, '')):
-                    is_path_ignored_result = True
-                    logging.debug("Ignoring path %s due to ignore_albums setting!", path_to_check)
-                    break
-
-    return is_path_ignored_result
 
 
 def add_assets_to_album(assets_add_album_id: str, asset_list: list[str]) -> list[str]:
@@ -1290,8 +840,6 @@ def choose_thumbnail(thumbnail_setting: str, thumbnail_asset_list: list[dict]) -
     # Case: Anything but fully qualified path
     # Apply filtering to assets
     thumbnail_assets = thumbnail_asset_list
-    if thumbnail_setting == ALBUM_THUMBNAIL_RANDOM_FILTERED:
-        thumbnail_assets[:] = [asset for asset in thumbnail_assets if not is_path_ignored(asset['originalPath'])]
 
     if len(thumbnail_assets) > 0:
         # Sort assets by creation date
@@ -1404,109 +952,6 @@ def check_api_response(response: requests.Response):
             logging.error("API response did not contain a payload")
     response.raise_for_status()
 
-def delete_all_albums(unarchive_assets: bool, force_delete: bool):
-    """
-    Deletes all albums in Immich if force_delete is True. Otherwise lists all albums
-    that would be deleted.
-    If unarchived_assets is set to true, all archived assets in deleted albums
-    will be unarchived.
-
-    Parameters
-    ----------
-        unarchive_assets : bool
-            Flag indicating whether to unarchive archived assets
-        force_delete : bool
-            Flag indicating whether to actually delete albums (True) or only to
-            perform a dry-run (False)
-   
-    Raises
-    ----------
-        HTTPError if the API call fails
-    """
-
-    all_albums = fetch_albums()
-    logging.info("%d existing albums identified", len(all_albums))
-    # Delete Confirm check
-    if not force_delete:
-        album_names = []
-        for album_to_delete in all_albums:
-            album_names.append(album_to_delete['albumName'])
-        print("Would delete the following albums (ALL albums!):")
-        print(album_names)
-        if is_docker:
-            print("Run the container with environment variable DELETE_CONFIRM set to 1 to actually delete these albums!")
-        else:
-            print("Call with --delete-confirm to actually delete albums!")
-        sys.exit(0)
-
-    deleted_album_count = 0
-    for album_to_delete in all_albums:
-        if delete_album(album_to_delete):
-             # If the archived flag is set it means we need to unarchived all images of deleted albums;
-            # In order to do so, we need to fetch all assets of the album we're going to delete
-            assets_in_deleted_album = []
-            if unarchive_assets:
-                album_to_delete_info = fetch_album_info(album_to_delete['id'])
-                assets_in_deleted_album = album_to_delete_info['assets']
-            logging.info("Deleted album %s", album_to_delete['albumName'])
-            deleted_album_count += 1
-            if len(assets_in_deleted_album) > 0 and unarchive_assets:
-                set_assets_archived([asset['id'] for asset in assets_in_deleted_album], False)
-                logging.info("Unarchived %d assets", len(assets_in_deleted_album))
-    logging.info("Deleted %d/%d albums", deleted_album_count, len(all_albums))
-
-def cleanup_albums(albums_to_delete: list[AlbumModel], force_delete: bool):
-    """
-    Instead of creating, deletes albums in Immich if force_delete is True. Otherwise lists all albums
-    that would be deleted.
-    If unarchived_assets is set to true, all archived assets in deleted albums
-    will be unarchived.
-
-    Parameters
-    ----------
-        albums_to_delete: list[AlbumModel]
-            A list of AlbumModel records to delete
-        force_delete : bool
-            Flag indicating whether to actually delete albums (True) or only to
-            perform a dry-run (False)
-
-    Returns
-    ----------
-        Number of successfully deleted albums
-   
-    Raises
-    ----------
-        HTTPError if the API call fails
-    """
-    # Delete Confirm check
-    if not force_delete:
-        print("Would delete the following albums:")
-        print([a.get_final_name() for a in albums_to_delete])
-        if is_docker:
-            print("Run the container with environment variable DELETE_CONFIRM set to 1 to actually delete these albums!")
-        else:
-            print(" Call with --delete-confirm to actually delete albums!")
-        return 0
-
-    # At this point force_delete is true!
-    cpt = 0
-    for album_to_delete in albums_to_delete:
-        # If the archived flag is set it means we need to unarchived all images of deleted albums;
-        # In order to do so, we need to fetch all assets of the album we're going to delete
-        assets_in_album = []
-        if album_to_delete.archive:
-            album_to_delete_info = fetch_album_info(album_to_delete.id)
-            assets_in_album = album_to_delete_info['assets']
-        if delete_album({'id': album_to_delete.id, 'albumName': album_to_delete.get_final_name()}):
-            logging.info("Deleted album %s", album_to_delete.get_final_name())
-            cpt += 1
-            # Archive flag is set, so we need to unarchive assets
-            if album_to_delete.archive and len(assets_in_album) > 0:
-                set_assets_archived([asset['id'] for asset in assets_in_album], False)
-                logging.info("Unarchived %d assets", len(assets_in_album))
-    return cpt
-
-
 def set_album_properties_in_model(album_model_to_update: AlbumModel):
     """
     Sets the album_model's properties based on script options set.
@@ -1549,77 +994,73 @@ def set_album_properties_in_model(album_model_to_update: AlbumModel):
     elif comments_and_likes_disabled:
         album_model_to_update.comments_and_likes_enabled = False
 
-def build_album_list(asset_list : list[dict], root_path_list : list[str], album_props_templates: dict) -> dict:
+def build_id_mapping(asset_list : list[dict], local_root_path : str, immich_root_path : str) -> dict:
+    asset_by_local_path = dict(
+            (local_root_path + asset['originalPath'][len(immich_root_path):], asset)
+            for asset in asset_list
+            if asset['originalPath'].startswith(immich_root_path)
+        )
+    with sqlite3.connect('file:' + os.path.join(local_root_path, 'database.sqlite3') + '?mode=ro', uri=True) as db:
+        cursor = db.cursor()
+        asset_by_gpid = {}
+        for row in cursor.execute('SELECT uuid, path FROM media'):
+            path = os.path.normpath(row[1])
+            asset = asset_by_local_path.get(path)
+            if asset is not None:
+                asset_by_gpid[row[0]] = asset
+            else:
+                logging.debug("Cannot map: %s", path)
+    return asset_by_gpid
+
+def build_album_list(asset_by_gpid : dict, local_root_path : str) -> dict:
     """
     Builds a list of album models, enriched with assets assigned to each album.
     Returns a dict where the key is the album name and the value is the model.
     Attention!
-
-    Parameters
-    ----------
-        asset_list : list[dict]
-            List of assets dictionaries fetched from Immich API
-        root_path_list : list[str]
-            List of root paths to use for album creation
-        album_props_templates: dict
-            Dictionary mapping an album name to album properties
-
-    Returns
-    ---------
-        A dict with album names as keys and an AlbumModel as value
     """
+    album_ids = set()
+    album_asset_ids = defaultdict(set)
     album_models = defaultdict(list)
-    for asset_to_add in asset_list:
-        asset_path = asset_to_add['originalPath']
-        # This method will log the ignore reason, so no need to log anything again.
-        if is_path_ignored(asset_path):
-            continue
 
-        # Identify the root path
-        asset_root_path = identify_root_path(asset_path, root_path_list)
-        if not asset_root_path:
+    debug_path = os.path.join(local_root_path, 'debug')
+    google_albums = json.load(open(os.path.join(debug_path, 'album_list.json'), 'r')) + \
+            json.load(open(os.path.join(debug_path, 'shared_album_list.json'), 'r'))
+    for google_album in google_albums:
+        if 'mediaItemsCount' not in google_album or 'title' not in google_album:
             continue
-
-        # Chunks of the asset's path below root_path
-        path_chunks = asset_path.replace(asset_root_path, '').split('/')
-        # A single chunk means it's just the image file in no sub folder, ignore
-        if len(path_chunks) == 1:
+        album_name = google_album['title']
+        album_id = google_album['id']
+        if album_id in album_ids:
             continue
+        album_ids.add(album_id)
 
-        # remove last item from path chunks, which is the file name
-        del path_chunks[-1]
-        album_name = create_album_name(path_chunks, album_level_separator, album_name_post_regex)
-        if len(album_name) > 0:
-            # First check if there are album properties for this album
-            if album_name in album_props_templates:
-                album_props_template = album_props_templates[album_name]
-                # Check if these album properties have already been used to create a new AlbumModel,
-                # if so, reuse!
-                if album_props_template.get_final_name() in album_models:
-                    new_album_model = album_models[album_props_template.get_final_name()]
-                else:
-                    new_album_model = AlbumModel(album_name)
-                    # Apply album properties from set options
-                    set_album_properties_in_model(new_album_model)
-                    # Check if we have album properties read from file
-                    # merge new album model with the one defined in our file, overriding any
-                    # pre-existing properties
-                    new_album_model.merge_from(album_props_template, AlbumModel.ALBUM_MERGE_MODE_OVERRIDE)
-            # There are no album properties, create a new AlbumModel from scratch
-            elif album_name not in album_models:
-                new_album_model = AlbumModel(album_name)
-                # Apply album properties from set options
-                set_album_properties_in_model(new_album_model)
-            # Reuse previously created AlbumModel
-            else:
-                new_album_model = album_models[album_name]
-            # Add asset to album model
-            new_album_model.assets.append(asset_to_add)
-            album_models[new_album_model.get_final_name()] = new_album_model
+        if album_name not in album_models:
+            new_album_model = AlbumModel(album_name)
+            thumbnail_id = google_album.get('coverPhotoMediaItemId')
+            if thumbnail_id is not None:
+                thumbnail_asset = asset_by_gpid.get(thumbnail_id)
+                if thumbnail_asset is not None:
+                    new_album_model.thumbnail_setting = thumbnail_asset['originalPath']
+            set_album_properties_in_model(new_album_model)
         else:
-            logging.warning("Got empty album name for asset path %s, check your album_level settings!", asset_path)
-    return album_models
+            new_album_model = album_models[album_name]
+        asset_ids = album_asset_ids[album_name]
 
+        google_assets = json.load(open(os.path.join(debug_path, f'album-{album_id}.json'), 'r'))
+        for google_asset in google_assets:
+            asset_id = google_asset['id']
+            if asset_id in asset_ids:
+                continue
+            asset_ids.add(asset_id)
+            asset = asset_by_gpid.get(asset_id)
+            if asset is None:
+                logging.debug("Cannot find media: %s", asset_id)
+            else:
+                new_album_model.assets.append(asset)
+
+        album_models[new_album_model.get_final_name()] = new_album_model
+
+    return album_models
 
 def find_user_by_name_or_email(name_or_email: str, user_list: list[dict]) -> dict:
     """
@@ -1646,41 +1087,16 @@ def find_user_by_name_or_email(name_or_email: str, user_list: list[dict]) -> dic
 
 parser = argparse.ArgumentParser(description="Create Immich Albums from an external library path based on the top level folders",
     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-parser.add_argument("root_path", action='append', help="The external library's root path in Immich")
+parser.add_argument("local_root_path", help="The external library's root path locally")
+parser.add_argument("immich_root_path", help="The external library's root path in Immich")
 parser.add_argument("api_url", help="The root API URL of immich, e.g. https://immich.mydomain.com/api/")
 parser.add_argument("api_key", help="The Immich API Key to use. Set --api-key-type to 'file' if a file path is provided.")
 parser.add_argument("-t", "--api-key-type", default="literal", choices=['literal', 'file'], help="The type of the Immich API Key")
-parser.add_argument("-r", "--root-path", action="append",
-                    help="Additional external library root path in Immich; May be specified multiple times for multiple import paths or external libraries.")
 parser.add_argument("-u", "--unattended", action="store_true", help="Do not ask for user confirmation after identifying albums. Set this flag to run script as a cronjob.")
-parser.add_argument("-a", "--album-levels", default="1", type=str,
-                    help="""Number of sub-folders or range of sub-folder levels below the root path used for album name creation.
-                            Positive numbers start from top of the folder structure, negative numbers from the bottom. Cannot be 0. 
-                            If a range should be set, the start level and end level must be separated by a comma like '<startLevel>,<endLevel>'. 
-                            If negative levels are used in a range, <startLevel> must be less than or equal to <endLevel>.""")
-parser.add_argument("-s", "--album-separator", default=" ", type=str,
-                    help="Separator string to use for compound album names created from nested folders. Only effective if -a is set to a value > 1")
-parser.add_argument("-R", "--album-name-post-regex", nargs='+',
-        action='append',
-        metavar=('PATTERN', 'REPL'),
-        help='Regex pattern and optional replacement (use "" for empty replacement). Can be specified multiple times.')
 parser.add_argument("-c", "--chunk-size", default=2000, type=int, help="Maximum number of assets to add to an album with a single API call")
 parser.add_argument("-C", "--fetch-chunk-size", default=5000, type=int, help="Maximum number of assets to fetch with a single API call")
 parser.add_argument("-l", "--log-level", default="INFO", choices=['CRITICAL', 'ERROR', 'WARNING', 'INFO', 'DEBUG'], help="Log level to use")
 parser.add_argument("-k", "--insecure", action="store_true", help="Pass to ignore SSL verification")
-parser.add_argument("-i", "--ignore", action="append",
-                    help="""Use either literals or glob-like patterns to ignore assets for album name creation.
-                            This filter is evaluated after any values passed with --path-filter. May be specified multiple times.""")
-parser.add_argument("-m", "--mode", default=SCRIPT_MODE_CREATE, choices=[SCRIPT_MODE_CREATE, SCRIPT_MODE_CLEANUP, SCRIPT_MODE_DELETE_ALL],
-                    help="""Mode for the script to run with.
-                            CREATE = Create albums based on folder names and provided arguments; 
-                            CLEANUP = Create album names based on current images and script arguments, but delete albums if they exist; 
-                            DELETE_ALL = Delete all albums. 
-                            If the mode is anything but CREATE, --unattended does not have any effect. 
-                            Only performs deletion if -d/--delete-confirm option is set, otherwise only performs a dry-run.""")
-parser.add_argument("-d", "--delete-confirm", action="store_true",
-                    help="""Confirm deletion of albums when running in mode """+SCRIPT_MODE_CLEANUP+""" or """+SCRIPT_MODE_DELETE_ALL+""".
-                            If this flag is not set, these modes will perform a dry run only. Has no effect in mode """+SCRIPT_MODE_CREATE)
 parser.add_argument("-x", "--share-with", action="append",
                     help="""A user name (or email address of an existing user) to share newly created albums with.
                     Sharing only happens if the album was actually created, not if new assets were added to an existing album.
@@ -1698,13 +1114,8 @@ parser.add_argument("-A", "--find-assets-in-albums", action="store_true",
                     help="""By default, the script only finds assets that are not assigned to any album yet.
                             Set this option to make the script discover assets that are already part of an album and handle them as usual.
                             If --find-archived-assets is set as well, both options apply.""")
-parser.add_argument("-f", "--path-filter", action="append",
-                    help="""Use either literals or glob-like patterns to filter assets before album name creation.
-                            This filter is evaluated before any values passed with --ignore. May be specified multiple times.""")
 parser.add_argument("--set-album-thumbnail", choices=ALBUM_THUMBNAIL_SETTINGS_GLOBAL,
                     help="""Set first/last/random image as thumbnail for newly created albums or albums assets have been added to.
-                            If set to """+ALBUM_THUMBNAIL_RANDOM_FILTERED+""", thumbnails are shuffled for all albums whose assets would not be
-                            filtered out or ignored by the ignore or path-filter options, even if no assets were added during the run.
                             If set to """+ALBUM_THUMBNAIL_RANDOM_ALL+""", the thumbnails for ALL albums will be shuffled on every run.""")
 parser.add_argument("-v", "--archive", action="store_true",
                     help="""Set this option to automatically archive all assets that were newly added to albums.
@@ -1728,6 +1139,8 @@ parser.add_argument("--update-album-props-mode", type=int, choices=[0, 1, 2], de
                             0 = Do not change album properties.
                             1 = Only override album properties but do not change the share status.
                             2 = Override album properties and share status, this will remove all users from the album which are not in the SHARE_WITH list.""")
+parser.add_argument("--sync-library", type=str, metavar="LIBRARY_ID",
+                    help="Sync the selected library before starting the main action")
 
 
 args = vars(parser.parse_args())
@@ -1735,7 +1148,8 @@ args = vars(parser.parse_args())
 logging.basicConfig(level=args["log_level"], stream=sys.stdout, format='time=%(asctime)s level=%(levelname)s msg=%(message)s')
 logging.Formatter.formatTime = (lambda self, record, datefmt=None: datetime.datetime.fromtimestamp(record.created, datetime.timezone.utc).astimezone().isoformat(sep="T",timespec="milliseconds"))
 
-root_paths = args["root_path"]
+local_root_path = args["local_root_path"]
+immich_root_path = args["immich_root_path"]
 root_url = args["api_url"]
 api_key = determine_api_key(args["api_key"], args["api_key_type"])
 if api_key is None:
@@ -1744,21 +1158,12 @@ if api_key is None:
 number_of_images_per_request = args["chunk_size"]
 number_of_assets_to_fetch_per_request = args["fetch_chunk_size"]
 unattended = args["unattended"]
-album_levels = args["album_levels"]
-# Album Levels Range handling
-album_levels_range_arr = ()
-album_level_separator = args["album_separator"]
-album_name_post_regex = args["album_name_post_regex"]
 album_order = args["album_order"]
 insecure = args["insecure"]
-ignore_albums = args["ignore"]
-mode = args["mode"]
-delete_confirm = args["delete_confirm"]
 share_with = args["share_with"]
 share_role = args["share_role"]
 sync_mode = args["sync_mode"]
 find_assets_in_albums = args["find_assets_in_albums"]
-path_filter = args["path_filter"]
 set_album_thumbnail = args["set_album_thumbnail"]
 archive = args["archive"]
 find_archived_assets = args["find_archived_assets"]
@@ -1770,35 +1175,24 @@ if comments_and_likes_disabled and comments_and_likes_enabled:
     logging.fatal("Arguments --comments-and-likes-enabled and --comments-and-likes-disabled cannot be used together! Choose one!")
     sys.exit(1)
 update_album_props_mode = args["update_album_props_mode"]
-
-# Override unattended if we're running in destructive mode
-if mode != SCRIPT_MODE_CREATE:
-    # pylint: disable=C0103
-    unattended = False
+library_to_sync = args["sync_library"]
 
 is_docker = os.environ.get(ENV_IS_DOCKER, False)
 
-logging.debug("root_path = %s", root_paths)
+logging.debug("local_root_path = %s", local_root_path)
+logging.debug("immich_root_path = %s", immich_root_path)
 logging.debug("root_url = %s", root_url)
 logging.debug("api_key = %s", api_key)
 logging.debug("number_of_images_per_request = %d", number_of_images_per_request)
 logging.debug("number_of_assets_to_fetch_per_request = %d", number_of_assets_to_fetch_per_request)
 logging.debug("unattended = %s", unattended)
-logging.debug("album_levels = %s", album_levels)
-#logging.debug("album_levels_range = %s", album_levels_range)
-logging.debug("album_level_separator = %s", album_level_separator)
-logging.debug("album_name_post_regex= %s", album_name_post_regex)
 logging.debug("album_order = %s", album_order)
 logging.debug("insecure = %s", insecure)
-logging.debug("ignore = %s", ignore_albums)
-logging.debug("mode = %s", mode)
-logging.debug("delete_confirm = %s", delete_confirm)
 logging.debug("is_docker = %s", is_docker)
 logging.debug("share_with = %s", share_with)
 logging.debug("share_role = %s", share_role)
 logging.debug("sync_mode = %d", sync_mode)
 logging.debug("find_assets_in_albums = %s", find_assets_in_albums)
-logging.debug("path_filter = %s", path_filter)
 logging.debug("set_album_thumbnail = %s", set_album_thumbnail)
 logging.debug("archive = %s", archive)
 logging.debug("find_archived_assets = %s", find_archived_assets)
@@ -1807,11 +1201,7 @@ logging.debug("api_timeout = %s", api_timeout)
 logging.debug("comments_and_likes_enabled = %s", comments_and_likes_enabled)
 logging.debug("comments_and_likes_disabled = %s", comments_and_likes_disabled)
 logging.debug("update_album_props_mode = %d", update_album_props_mode)
-
-# Verify album levels
-if is_integer(album_levels) and album_levels == 0:
-    parser.print_help()
-    sys.exit(1)
+logging.debug("library_to_sync = %d", library_to_sync)
 
 # Request arguments for API calls
 requests_kwargs = {
@@ -1826,57 +1216,12 @@ requests_kwargs = {
 if insecure:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Verify album levels range
-if not is_integer(album_levels):
-    album_levels_range_split = album_levels.split(",")
-    if any([
-            len(album_levels_range_split) != 2,
-            not is_integer(album_levels_range_split[0]),
-            not is_integer(album_levels_range_split[1]),
-            int(album_levels_range_split[0]) == 0,
-            int(album_levels_range_split[1]) == 0,
-            (int(album_levels_range_split[1]) < 0 <= int(album_levels_range_split[0])),
-            (int(album_levels_range_split[0]) < 0 <= int(album_levels_range_split[1])),
-            (int(album_levels_range_split[0]) < 0 and int(album_levels_range_split[1]) < 0 and int(album_levels_range_split[0]) > int(album_levels_range_split[1]))
-        ]):
-        logging.error(("Invalid album_levels range format! If a range should be set, the start level and end level must be separated by a comma like '<startLevel>,<endLevel>'. "
-                      "If negative levels are used in a range, <startLevel> must be less than or equal to <endLevel>."))
-        sys.exit(1)
-    album_levels_range_arr = album_levels_range_split
-    # Convert to int
-    album_levels_range_arr[0] = int(album_levels_range_split[0])
-    album_levels_range_arr[1] = int(album_levels_range_split[1])
-    # Special case: both levels are negative and end level is -1, which is equivalent to just negative album level of start level
-    if(album_levels_range_arr[0] < 0 and album_levels_range_arr[1] == -1):
-        album_levels = album_levels_range_arr[0]
-        album_levels_range_arr = ()
-        logging.debug("album_levels is a range with negative start level and end level of -1, converted to album_levels = %d", album_levels)
-    else:
-        logging.debug("valid album_levels range argument supplied")
-        logging.debug("album_levels_start_level = %d", album_levels_range_arr[0])
-        logging.debug("album_levels_end_level = %d", album_levels_range_arr[1])
-        # Deduct 1 from album start levels, since album levels start at 1 for user convenience, but arrays start at index 0
-        if album_levels_range_arr[0] > 0:
-            album_levels_range_arr[0] -= 1
-            album_levels_range_arr[1] -= 1
-
-# Create ignore regular expressions
-ignore_albums_regex = []
-if ignore_albums:
-    for ignore_albums_entry in ignore_albums:
-        ignore_albums_regex.append(glob_to_re(expand_to_glob(ignore_albums_entry)))
-
-# Create path filter regular expressions
-path_filter_regex = []
-if path_filter:
-    for path_filter_entry in path_filter:
-        path_filter_regex.append(glob_to_re(expand_to_glob(path_filter_entry)))
-
 # append trailing slash to all root paths
 # pylint: disable=C0200
-for i in range(len(root_paths)):
-    if root_paths[i][-1] != '/':
-        root_paths[i] = root_paths[i] + '/'
+if local_root_path[-1] != '/':
+    local_root_path = local_root_path + '/'
+if immich_root_path[-1] != '/':
+    immich_root_path = immich_root_path + '/'
 # append trailing slash to root URL
 if root_url[-1] != '/':
     root_url = root_url + '/'
@@ -1887,11 +1232,8 @@ if version['major'] == 1 and version ['minor'] < 106:
     logging.fatal("This script only works with Immich Server v1.106.0 and newer! Update Immich Server or use script version 0.8.1!")
     sys.exit(1)
 
-
-# Special case: Run Mode DELETE_ALL albums
-if mode == SCRIPT_MODE_DELETE_ALL:
-    delete_all_albums(archive, delete_confirm)
-    sys.exit(0)
+if library_to_sync is not None:
+    sync_library(library_to_sync)
 
 album_properties_templates = {}
 if read_album_properties:
@@ -1901,24 +1243,21 @@ if read_album_properties:
         logging.debug("Albumprops: %s -> %s", album_properties_path, album_properties_template)
 
 logging.info("Requesting all assets")
-# only request images that are not in any album if we are running in CREATE mode,
-# otherwise we need all images, even if they are part of an album
-if mode == SCRIPT_MODE_CREATE:
-    assets = fetch_assets(not find_assets_in_albums, find_archived_assets)
-else:
-    assets = fetch_assets(False, True)
+assets = fetch_assets(not find_assets_in_albums, find_archived_assets)
 logging.info("%d photos found", len(assets))
 
+logging.info("Mapping Google Photos IDs to Immich assets")
+asset_by_gpid = build_id_mapping(assets, local_root_path, immich_root_path)
+logging.info("%d photos mapped", len(asset_by_gpid))
 
-
-logging.info("Sorting assets to corresponding albums using folder name")
-albums_to_create = build_album_list(assets, root_paths, album_properties_templates)
+logging.info("Sorting assets to corresponding albums using Google Photos archiver debug metadata")
+albums_to_create = build_album_list(asset_by_gpid, local_root_path)
 albums_to_create = dict(sorted(albums_to_create.items(), key=lambda item: item[0]))
 
 logging.info("%d albums identified", len(albums_to_create))
 logging.info("Album list: %s", list(albums_to_create.keys()))
 
-if not unattended and mode == SCRIPT_MODE_CREATE:
+if not unattended:
     if is_docker:
         print("Check that this is the list of albums you want to create. Run the container with environment variable UNATTENDED set to 1 to actually create these albums.")
         sys.exit(0)
@@ -1936,19 +1275,6 @@ for album in albums_to_create.values():
     if album.get_final_name() in album_to_id:
         # Album already exists, just get the ID
         album.id = album_to_id[album.get_final_name()]
-
-# mode CLEANUP
-if mode == SCRIPT_MODE_CLEANUP:
-    # Filter list of albums to create for existing albums only
-    albums_to_cleanup = {}
-    for album in albums_to_create.values():
-        # Only cleanup existing albums (has id set) and no duplicates (due to override_name)
-        if album.id and album.id not in albums_to_cleanup:
-            albums_to_cleanup[album.id] = album
-    # pylint: disable=C0103
-    number_of_deleted_albums = cleanup_albums(albums_to_cleanup.values(), delete_confirm)
-    logging.info("Deleted %d/%d albums", number_of_deleted_albums, len(albums_to_cleanup))
-    sys.exit(0)
 
 # Get all users in preparation for album sharing
 users = fetch_users()
