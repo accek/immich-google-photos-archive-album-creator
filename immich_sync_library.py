@@ -122,17 +122,15 @@ def fetch_server_version() -> dict:
 
 
 def sync_library(library_id: str, wait: bool) -> None:
-    request_time = datetime.datetime.now(datetime.UTC)
     r = requests.post(root_url+'libraries/'+library_id+'/scan', **requests_kwargs, timeout=api_timeout)
     check_api_response(r)
 
     if wait:
         while True:
             time.sleep(1)
-            r = requests.get(root_url+'libraries/'+library_id, **requests_kwargs, timeout=api_timeout)
+            r = requests.get(root_url+'jobs', **requests_kwargs, timeout=api_timeout)
             check_api_response(r)
-            refreshed_at = datetime.datetime.fromisoformat(r.json()["refreshedAt"])
-            if refreshed_at > request_time:
+            if r.json().get("library", {}).get("jobCounts", {}).get("active", 0) == 0:
                 break
 
 def check_api_response(response: requests.Response):
